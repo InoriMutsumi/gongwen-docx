@@ -17,15 +17,26 @@
   ## 二级标题      → 3 号楷体_GB2312 「（一）」
   ### 三级标题     → 3 号仿宋        「1.」
   其余非空行       → 正文段（3 号仿宋，首行缩进 2 字）
-  空行用于分隔，不产生空段。
 
-退出码：0 正常；2 缺字体未获允许；3 缺依赖；1 参数或读取错误。
+分段规则：空行分段。连续的非空普通行合并成同一个正文段（段内中文直接相连，
+英文/数字相接处补一个半角空格）；空行本身不产生空段。整份文件一个空行都没有
+时，退回「一行一段」，免得整篇正文被合并成一大段。
+
+层级标记只换字体，不自动加编号——「一、」「（一）」「1.」要自己写进文本。
+
+字体缺失时文件名仍按规范写入，脚本不做替换；--force / --allow-missing-fonts
+只负责放行，实际显示由打开文档的机器决定。
+
+退出码：0 正常；1 参数或读取错误；2 缺字体未获允许；3 缺依赖；
+        4 文档已生成但页码设置失败。
 """
 
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
+import re
 import sys
 
 # ---------------------------------------------------------------- 版式常量
@@ -254,10 +265,12 @@ def make_helpers(Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, OxmlElement, qn,
         return [field_run(begin), field_run(separate), field_run(end)]
 
     def add_page_numbers(doc, section, hide_first_page=False):
+        """写入奇偶页页码；返回失败项列表，空列表表示全部成功。"""
+        problems = []
         try:
             doc.settings.odd_and_even_pages_header_footer = True
-        except Exception:
-            pass
+        except Exception as exc:
+            problems.append("奇偶页页脚开关设置失败：%s" % exc)
 
         def fill(par, align, edge_pt):
             par.alignment = align
@@ -274,21 +287,25 @@ def make_helpers(Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, OxmlElement, qn,
             for r in runs:
                 set_run_font(r, FONT_PAGE, Pt(SIZE_PAGE))
 
-        odd = section.footer.paragraphs[0]
-        fill(odd, WD_ALIGN_PARAGRAPH.RIGHT, SIZE_BODY)  # 单页：居右空一字
+        try:
+            odd = section.footer.paragraphs[0]
+            fill(odd, WD_ALIGN_PARAGRAPH.RIGHT, SIZE_BODY)  # 单页：居右空一字
+        except Exception as exc:
+            problems.append("单页页码写入失败：%s" % exc)
 
         try:
             section.even_page_footer.is_linked_to_previous = False
             even = section.even_page_footer.paragraphs[0]
             fill(even, WD_ALIGN_PARAGRAPH.LEFT, SIZE_BODY)  # 双页：居左空一字
-        except Exception:
-            pass
+        except Exception as exc:
+            problems.append("双页页码写入失败：%s" % exc)
 
         if hide_first_page:
             try:
                 section.different_first_page_header_footer = True
-            except Exception:
-                pass
+            except Exception as exc:
+                problems.append("首页不编页码设置失败：%s" % exc)
+        return problems
 
     return set_run_font, add_par, blank_line, setup_section, add_page_numbers
 
@@ -306,21 +323,95 @@ def text_width_chars(s: str) -> float:
     return w
 
 
+def _needs_space(prev: str, nxt: str) -> bool:
+    """段内换行合并时：英文或数字相接补一个空格，中文直接相连。"""
+    if not prev or not nxt:
+        return False
+    return prev.isascii() and nxt.isascii() and prev.isalnum() and nxt.isalnum()
+
+
 def parse_body(text: str):
-    blocks = []
-    for raw in text.splitlines():
+    """空行分段：连续非空普通行合并成一段，# 标记行单独成段。
+
+    整份文件里一个空行都没有时，退回「一行一段」的老写法（否则会把整篇正文
+    合并成一大段）。一旦出现空行，就一律按空行分段。
+    """
+    blocks: list[tuple[str, str]] = []
+    buf: list[str] = []
+    lines = text.splitlines()
+    has_blank = any(not ln.strip() for ln in lines)
+
+    def flush():
+        if buf:
+            blocks.append(("p", "".join(buf)))
+            buf.clear()
+
+    for raw in lines:
         line = raw.rstrip()
         if not line.strip():
+            flush()
             continue
         if line.startswith("### "):
+            flush()
             blocks.append(("h3", line[4:].strip()))
         elif line.startswith("## "):
+            flush()
             blocks.append(("h2", line[3:].strip()))
         elif line.startswith("# "):
+            flush()
             blocks.append(("h1", line[2:].strip()))
         else:
-            blocks.append(("p", line.strip()))
+            piece = line.strip()
+            if has_blank:
+                if buf and _needs_space(buf[-1][-1:], piece[:1]):
+                    buf.append(" ")
+                buf.append(piece)
+            else:
+                buf.append(piece)
+                flush()
+    flush()
     return blocks
+
+
+# ---------------------------------------------------------------- 输入校验
+
+def _valid_date(s: str) -> bool:
+    m = re.match(r"^(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日$", s.strip())
+    if not m:
+        return False
+    y, mo, d = (int(x) for x in m.groups())
+    try:
+        datetime.date(y, mo, d)
+    except ValueError:
+        return False
+    return True
+
+
+def strip_attach_prefix(s: str) -> str:
+    s = s.strip()
+    for prefix in ("附件：", "附件:"):
+        if s.startswith(prefix):
+            return s[len(prefix):].strip()
+    return s
+
+
+def validate_args(args) -> tuple[list[str], list[str]]:
+    """返回 (阻断性错误, 提醒)。错误退出码 1，提醒只打印。"""
+    errors: list[str] = []
+    notices: list[str] = []
+
+    if not args.out.lower().endswith(".docx"):
+        errors.append("--out 必须以 .docx 结尾：%s" % args.out)
+    if args.date and not _valid_date(args.date):
+        errors.append("--date 应为「YYYY 年 M 月 D 日」且日期真实存在：%s" % args.date)
+    if args.to and not args.to.rstrip().endswith("："):
+        notices.append("--to 建议以全角冒号「：」结尾：%s" % args.to)
+    if args.body and not os.path.isfile(args.body):
+        errors.append("正文文件不存在：%s" % args.body)
+    for item in args.attach or []:
+        if item.strip().startswith(("附件：", "附件:")):
+            notices.append("--attach 自带的「附件：」已去掉，避免重复：%s" % item)
+    return errors, notices
 
 
 # ---------------------------------------------------------------- 主流程
@@ -372,7 +463,8 @@ def build_document(args):
         blank_line(doc, 1)
         first = True
         for item in args.attach:
-            label = "附件：%s" % item if first else item
+            text = strip_attach_prefix(item)
+            label = "附件：%s" % text if first else text
             add_par(doc, label, font=FONT_BODY,
                     indent_chars=0, left_chars=INDENT_CHARS)
             first = False
@@ -401,20 +493,30 @@ def build_document(args):
             note = "（%s）" % note.strip("（）()")
         add_par(doc, note, font=FONT_BODY, indent_chars=0, left_chars=INDENT_CHARS)
 
-    add_page_numbers(doc, section, hide_first_page=args.hide_first_page_number)
+    page_problems = add_page_numbers(doc, section, hide_first_page=args.hide_first_page_number)
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     if out_dir and not os.path.isdir(out_dir):
         os.makedirs(out_dir, exist_ok=True)
     doc.save(args.out)
-    return doc, blocks
+    return doc, blocks, page_problems
+
+
+class _ArgumentParser(argparse.ArgumentParser):
+    """参数错误统一退出码 1，避免与「缺字体 = 2」混淆。"""
+
+    def error(self, message):
+        self.print_usage(sys.stderr)
+        self.exit(1, "%s: 参数错误：%s\n" % (self.prog, message))
 
 
 def main(argv=None):
-    parser = argparse.ArgumentParser(
+    parser = _ArgumentParser(
         description="按 GB/T 9704-2012 版式生成公文 Word（无红头）")
     parser.add_argument("--check-fonts", action="store_true", help="只检查字体")
-    parser.add_argument("--force", action="store_true", help="缺字体也继续生成")
+    parser.add_argument("--force", "--allow-missing-fonts", dest="force",
+                        action="store_true",
+                        help="缺字体也继续生成（只放行，不替换字体名）")
     parser.add_argument("--out", help="输出 .docx 路径")
     parser.add_argument("--title", help="标题")
     parser.add_argument("--to", help="主送机关，如「各处室：」")
@@ -427,21 +529,30 @@ def main(argv=None):
                         help="首页不编页码（发文惯例）")
     args = parser.parse_args(argv)
 
-    missing = find_missing_fonts()
-
     if args.check_fonts:
+        missing = find_missing_fonts()
         if not missing:
             print("字体齐全：方正小标宋简体 / 仿宋_GB2312 / 楷体_GB2312 / 黑体 / 宋体")
             return 0
         print("缺少以下公文字体（共 %d 项）：" % len(missing))
         for font, role in missing:
             print("  - %-18s（用于%s）" % (font, role))
-        print("请先安装上述字体；临时可用 --force 继续，但生成的文档字体与规范不符。")
+        print("请先安装上述字体；临时可用 --force（别名 --allow-missing-fonts）继续，"
+              "但脚本不会替换字体名，显示效果由打开文档的机器决定。")
         return 2
 
     if not args.out or not args.title:
         parser.error("生成文档需要同时提供 --out 和 --title")
 
+    errors, notices = validate_args(args)
+    for note in notices:
+        print("提醒：%s" % note)
+    if errors:
+        for err in errors:
+            print("参数错误：%s" % err, file=sys.stderr)
+        return 1
+
+    missing = find_missing_fonts()
     if missing:
         print("缺少以下公文字体（共 %d 项）：" % len(missing), file=sys.stderr)
         for font, role in missing:
@@ -449,9 +560,10 @@ def main(argv=None):
         if not args.force:
             print("未获允许，已停止。装上字体后重跑，或明确同意后加 --force。", file=sys.stderr)
             return 2
-        print("已按 --force 继续生成，文档字体将不完全符合规范。", file=sys.stderr)
+        print("已按 --force 继续生成：文档内仍写规范字体名，缺失字体由 Word/WPS "
+              "打开时替代显示，实际效果不可控。", file=sys.stderr)
 
-    doc, blocks = build_document(args)
+    doc, blocks, page_problems = build_document(args)
     print("已生成：%s" % os.path.abspath(args.out))
     print("版式：A4，页边距 上%d/下%d/左%d/右%d mm，固定行距 %d 磅，每页 22 行"
           % (MM_TOP, MM_BOTTOM, MM_LEFT, MM_RIGHT, LINE_PITCH_PT))
@@ -459,8 +571,13 @@ def main(argv=None):
     print("字体：标题 %s %dpt｜正文 %s %dpt｜页码 %s %dpt"
           % (FONT_TITLE, SIZE_TITLE, FONT_BODY, SIZE_BODY, FONT_PAGE, SIZE_PAGE))
     if missing:
-        print("注意：下列字体缺失，已按要求继续：%s"
+        print("注意：下列字体缺失，文档内仍按规范字体名写入（打开时由系统替代）：%s"
               % "、".join(f for f, _ in missing))
+    if page_problems:
+        print("警告：页码设置未全部成功，请检查页脚：", file=sys.stderr)
+        for problem in page_problems:
+            print("  - %s" % problem, file=sys.stderr)
+        return 4
     return 0
 
 
