@@ -44,14 +44,23 @@ import datetime
 import os
 import re
 import sys
+import tempfile
 
-# 控制台输出统一走 UTF-8：Windows 上默认编码可能是 cp1252 / cp936，打印中文直接抛
-# UnicodeEncodeError，会让已经生成好的文档卡在最后一步。errors="replace" 保证不崩。
-for _stream in (sys.stdout, sys.stderr):
-    try:
-        _stream.reconfigure(encoding="utf-8", errors="replace")
-    except Exception:
-        pass
+
+def _setup_console() -> None:
+    """把控制台输出切成 UTF-8。
+
+    Windows 上默认编码可能是 cp1252 / cp936，打印中文直接抛 UnicodeEncodeError，
+    会让已经生成好的文档卡在最后一步。errors="replace" 保证不崩。
+
+    只在 main() 里调用：这个脚本也会被测试或别的程序 import，import 时不该顺手
+    改掉宿主的 stdout/stderr。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
 
 # ---------------------------------------------------------------- 版式常量
 
@@ -91,6 +100,11 @@ FONT_FILE_HINTS = {
 }
 
 
+def _os_error_text(exc: OSError) -> str:
+    """只取错误描述，不带路径——日志可能原样贴到 issue 里。"""
+    return exc.strerror or exc.__class__.__name__
+
+
 def _strip_font_suffix(name: str) -> str:
     for suffix in (" (TrueType)", " (OpenType)", " (TrueType)"):
         if name.endswith(suffix):
@@ -127,24 +141,25 @@ def installed_fonts() -> tuple[set[str], set[str], list[str]]:
                         if base:
                             files.add(base.upper())
             except OSError as exc:
-                errors.append("读注册表 %s 失败：%s" % (root_name, exc))
+                errors.append("读注册表 %s 失败：%s" % (root_name, _os_error_text(exc)))
     else:
         errors.append("当前 Python 没有 winreg 模块，读不到字体注册表")
 
     # 字体目录兜底（用户自装字体有时没进注册表）
     win_dir = os.environ.get("WINDIR", r"C:\Windows")
     dirs = [
-        os.path.join(win_dir, "Fonts"),
-        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "Windows", "Fonts"),
+        ("系统字体目录", os.path.join(win_dir, "Fonts")),
+        ("用户字体目录", os.path.join(os.environ.get("LOCALAPPDATA", ""),
+                                "Microsoft", "Windows", "Fonts")),
     ]
-    for d in dirs:
+    for label, d in dirs:
         try:
             for fn in os.listdir(d):
                 base = os.path.splitext(fn)[0]
                 if base:
                     files.add(base.upper())
         except OSError as exc:
-            errors.append("读字体目录 %s 失败：%s" % (d, exc))
+            errors.append("读%s失败：%s" % (label, _os_error_text(exc)))
 
     return names, files, errors
 
@@ -159,6 +174,11 @@ def find_missing_fonts() -> tuple[list[tuple[str, str]], str | None]:
     if not names and not files:
         reason = "；".join(errors) if errors else "没有读到任何已安装字体"
         return [(font, role) for font, role in REQUIRED_FONTS], reason
+    if errors:
+        # 部分来源读失败：结论可能少算，但还没到「一条都没读到」的程度，
+        # 所以不把退出码抬到 5，只用一句提醒把不确定性说清楚。
+        print("提醒：字体检测不完整（%s），缺失结论可能不准。" % "；".join(errors),
+              file=sys.stderr)
     missing: list[tuple[str, str]] = []
     for font, role in REQUIRED_FONTS:
         if font in names or font.lower() in {n.lower() for n in names}:
@@ -452,7 +472,9 @@ def validate_args(args) -> tuple[list[str], list[str]]:
         errors.append("--title 不能是空白")
     if args.date and not _valid_date(args.date):
         errors.append("--date 应为「YYYY 年 M 月 D 日」且日期真实存在：%s" % args.date)
-    if args.to and args.to.strip() and not args.to.rstrip().endswith("："):
+    if args.to is not None and not args.to.strip():
+        errors.append("--to 不能是空白（不要主送机关就别传这个参数）")
+    elif args.to and not args.to.rstrip().endswith("："):
         errors.append("--to 应以全角冒号「：」结尾（主送机关后是冒号）：%s" % args.to)
     if args.body and not os.path.isfile(args.body):
         errors.append("正文文件不存在：%s" % args.body)
@@ -524,15 +546,21 @@ def build_document(args):
     # 附件说明：正文下空 1 行，左空 2 字；续行与附件名称首字对齐
     if args.attach:
         blank_line(doc, 1)
-        for idx, item in enumerate(args.attach):
+        shown = 0
+        for item in args.attach:
             text = strip_attach_prefix(item)
-            if idx == 0:
+            if not text:
+                continue
+            if shown == 0:
                 # 「附件：」占 3 字，悬挂 3 字让第 2 行起对齐到「1.」
                 add_par(doc, "附件：%s" % text, font=FONT_BODY,
                         indent_chars=0, left_chars=INDENT_CHARS, hanging_chars=3.0)
             else:
+                # 保持与第 1 条的「1.」对齐；悬挂 1.5 字让折行退到名称首字附近
                 add_par(doc, text, font=FONT_BODY,
-                        indent_chars=0, left_chars=INDENT_CHARS + 3.0)
+                        indent_chars=0, left_chars=INDENT_CHARS + 3.0,
+                        hanging_chars=1.5)
+            shown += 1
 
     # 发文机关署名 + 成文日期：附件说明下空 1 行；日期右空 4 字，署名居中于日期
     if args.sign or args.date:
@@ -571,6 +599,7 @@ class _ArgumentParser(argparse.ArgumentParser):
 
 
 def main(argv=None):
+    _setup_console()
     parser = _ArgumentParser(
         description="按 GB/T 9704-2012 版式生成公文 Word（无红头）")
     parser.add_argument("--check-fonts", action="store_true", help="只检查字体")
@@ -638,19 +667,28 @@ def main(argv=None):
 
     doc, blocks, page_problems = build_document(args)
 
-    tmp_path = args.out + ".tmp"
     out_dir = os.path.dirname(os.path.abspath(args.out))
+    tmp_path = ""
     try:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
+        # 唯一临时名：同一目录里并发生成两份文档时不会互相覆盖
+        fd, tmp_path = tempfile.mkstemp(
+            prefix=os.path.basename(args.out) + ".", suffix=".tmp",
+            dir=out_dir or None)
+        os.close(fd)
         doc.save(tmp_path)
         os.replace(tmp_path, args.out)
     except OSError as exc:
-        print("写入失败：%s（目标 %s）" % (exc, _display_path(args.out)), file=sys.stderr)
-        try:
-            os.unlink(tmp_path)
-        except OSError:
-            pass
+        print("写入失败：%s（目标 %s）" % (_os_error_text(exc), _display_path(args.out)),
+              file=sys.stderr)
+        if tmp_path:
+            try:
+                os.unlink(tmp_path)
+            except OSError as cleanup_exc:
+                print("提醒：临时文件没清掉：%s（%s）"
+                      % (_display_path(tmp_path), _os_error_text(cleanup_exc)),
+                      file=sys.stderr)
         return 1
 
     print("已生成：%s" % _display_path(args.out))

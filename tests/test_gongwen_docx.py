@@ -20,12 +20,14 @@ sys.path.insert(0, SCRIPTS)
 
 import gongwen_docx as gw  # noqa: E402
 from docx import Document  # noqa: E402
+from docx.enum.text import WD_ALIGN_PARAGRAPH  # noqa: E402
 from docx.oxml.ns import qn  # noqa: E402
 from docx.shared import Mm  # noqa: E402
 
 
 def _args(**kw):
-    base = dict(out="a.docx", title="t", date=None, to=None, body=None, attach=None)
+    base = dict(out="a.docx", title="t", date=None, to=None, body=None, attach=None,
+                sign=None, note=None, hide_first_page_number=False)
     base.update(kw)
     return types.SimpleNamespace(**base)
 
@@ -67,6 +69,15 @@ class TextUtilTest(unittest.TestCase):
         self.assertFalse(gw._valid_date("2025-10-25"))
         self.assertFalse(gw._valid_date("2025 年 2 月 30 日"))
 
+    def test_valid_date_leap_year(self):
+        self.assertTrue(gw._valid_date("2024 年 2 月 29 日"))
+        self.assertFalse(gw._valid_date("2025 年 2 月 29 日"))
+
+    def test_valid_date_out_of_range(self):
+        self.assertFalse(gw._valid_date("2025 年 13 月 1 日"))
+        self.assertFalse(gw._valid_date("2025 年 0 月 1 日"))
+        self.assertFalse(gw._valid_date("2025 年 1 月 0 日"))
+
     def test_strip_attach_prefix(self):
         self.assertEqual(gw.strip_attach_prefix("附件：1. 某某表"), "1. 某某表")
         self.assertEqual(gw.strip_attach_prefix("2. 别的"), "2. 别的")
@@ -90,6 +101,11 @@ class ValidateArgsTest(unittest.TestCase):
         self.assertTrue(any("冒号" in e for e in errors))
         errors, _ = gw.validate_args(_args(to="各处室："))
         self.assertEqual(errors, [])
+
+    def test_blank_to_is_error(self):
+        errors, _ = gw.validate_args(_args(to="   "))
+        self.assertTrue(any("--to" in e for e in errors))
+        self.assertEqual(gw.validate_args(_args(to=None))[0], [])
 
     def test_bad_date(self):
         errors, _ = gw.validate_args(_args(date="2025-10-25"))
@@ -140,14 +156,46 @@ class ExitCodeTest(unittest.TestCase):
 
     def test_page_problem_returns_4(self):
         def fake_build(args):
+            def fake_save(path):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+
             doc = mock.Mock()
-            doc.save = lambda path: open(path, "wb").write(b"x")
+            doc.save = fake_save
             return doc, [], ["页码炸了"]
 
         with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
                 mock.patch.object(gw, "build_document", side_effect=fake_build):
             code = gw.main(["--out", os.path.join(self.tmp, "x.docx"), "--title", "t"])
         self.assertEqual(code, 4)
+
+    def test_save_error_returns_1_cleans_temp_and_hides_path(self):
+        def fake_build(args):
+            def boom(path):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+                raise OSError(28, "No space left on device")
+
+            doc = mock.Mock()
+            doc.save = boom
+            return doc, [], []
+
+        out = os.path.join(self.tmp, "x.docx")
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                mock.patch.object(gw, "build_document", side_effect=fake_build), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gw.main(["--out", out, "--title", "t"])
+        self.assertEqual(code, 1)
+        self.assertFalse(os.path.exists(out))
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])
+        self.assertIn("No space left on device", err.getvalue())
+        self.assertNotIn(self.tmp, err.getvalue())
+
+    def test_out_pointing_to_directory_returns_1(self):
+        target = os.path.join(self.tmp, "x.docx")
+        os.makedirs(target)
+        code = self._main(["--out", target, "--title", "t"])
+        self.assertEqual(code, 1)
 
 
 class GenerateTest(unittest.TestCase):
@@ -167,7 +215,10 @@ class GenerateTest(unittest.TestCase):
                 fh.write(body_text)
             argv += ["--body", path]
         for key, value in extra.items():
-            argv += [key, value]
+            if value is True:
+                argv.append(key)
+            else:
+                argv += [key, value]
         with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
                 contextlib.redirect_stdout(io.StringIO()):
             code = gw.main(argv)
@@ -191,6 +242,7 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(run.font.size.pt, 22)
         rfonts = run._element.rPr.rFonts
         self.assertEqual(rfonts.get(qn("w:eastAsia")), "方正小标宋简体")
+        self.assertEqual(title.alignment, WD_ALIGN_PARAGRAPH.CENTER)
 
     def test_body_font_and_indent(self):
         doc = self._generate("正文第一段。\n\n正文第二段。\n")
@@ -219,13 +271,40 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(ind1.get(qn("w:hangingChars")), "300")
         self.assertAlmostEqual(first.paragraph_format.left_indent.pt, 80, places=1)
         self.assertAlmostEqual(first.paragraph_format.first_line_indent.pt, -48, places=1)
-        self.assertAlmostEqual(second.paragraph_format.left_indent.pt, 80, places=1)
+        # 第 2 条与第 1 条的「1.」对齐（左空 2 + 「附件：」3 = 5 字），另加 1.5 字续行悬挂
+        ind2 = second._p.pPr.find(qn("w:ind"))
+        self.assertEqual(ind2.get(qn("w:hangingChars")), "150")
+        self.assertAlmostEqual(second.paragraph_format.left_indent.pt, 104, places=1)
+        self.assertAlmostEqual(second.paragraph_format.first_line_indent.pt, -24, places=1)
+
+    def test_attachment_skips_blank_and_keeps_alignment(self):
+        # 传了空串时，实际第一条仍要带「附件：」，不能把第 2 条顶到「附件：」位置
+        args = _args(attach=["  ", "1. 表"], sign=None, note=None)
+        doc, _blocks, _problems = gw.build_document(args)
+        attach = [p for p in doc.paragraphs if p.text.startswith("附件：")]
+        self.assertEqual([p.text for p in attach], ["附件：1. 表"])
 
     def test_page_number_field(self):
         doc = self._generate()
         xml = doc.sections[0].footer.paragraphs[0]._p.xml
         self.assertIn("PAGE", xml)
         self.assertIn("— ", doc.sections[0].footer.paragraphs[0].text)
+
+    def test_page_number_layout(self):
+        doc = self._generate()
+        odd = doc.sections[0].footer.paragraphs[0]
+        even = doc.sections[0].even_page_footer.paragraphs[0]
+        self.assertEqual(odd.alignment, WD_ALIGN_PARAGRAPH.RIGHT)
+        self.assertEqual(even.alignment, WD_ALIGN_PARAGRAPH.LEFT)
+        for par in (odd, even):
+            self.assertIn("PAGE", par._p.xml)
+            self.assertEqual(par.runs[0].font.size.pt, 14)
+            self.assertEqual(par.runs[0]._element.rPr.rFonts.get(qn("w:eastAsia")), "宋体")
+        self.assertTrue(doc.settings.odd_and_even_pages_header_footer)
+
+    def test_hide_first_page_number(self):
+        doc = self._generate(**{"--hide-first-page-number": True})
+        self.assertTrue(doc.sections[0].different_first_page_header_footer)
 
     def test_note_wrapped_in_parentheses(self):
         doc = self._generate()
