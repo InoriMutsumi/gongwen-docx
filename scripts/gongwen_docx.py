@@ -45,6 +45,14 @@ import os
 import re
 import sys
 
+# 控制台输出统一走 UTF-8：Windows 上默认编码可能是 cp1252 / cp936，打印中文直接抛
+# UnicodeEncodeError，会让已经生成好的文档卡在最后一步。errors="replace" 保证不崩。
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 # ---------------------------------------------------------------- 版式常量
 
 MM_TOP = 37          # 页边距 上
