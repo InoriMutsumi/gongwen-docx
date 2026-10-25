@@ -16,7 +16,10 @@
   # 一级标题      → 3 号黑体        「一、」
   ## 二级标题      → 3 号楷体_GB2312 「（一）」
   ### 三级标题     → 3 号仿宋        「1.」
+  #### 四级标题    → 3 号仿宋        「（1）」
   其余非空行       → 正文段（3 号仿宋，首行缩进 2 字）
+
+正文行首真的要以 # 开头时，写成 \\# —— 反斜杠会被吃掉，井号原样保留。
 
 分段规则：空行分段。连续的非空普通行合并成同一个正文段（段内中文直接相连，
 英文/数字相接处补一个半角空格）；空行本身不产生空段。整份文件一个空行都没有
@@ -24,11 +27,14 @@
 
 层级标记只换字体，不自动加编号——「一、」「（一）」「1.」要自己写进文本。
 
+字体检测只支持 Windows（读注册表 + 系统字体目录）。非 Windows，或一条字体信息
+都读不出来时，脚本不猜：按「无法确认」处理，退出码 5，加 --force 可放行继续。
+
 字体缺失时文件名仍按规范写入，脚本不做替换；--force / --allow-missing-fonts
 只负责放行，实际显示由打开文档的机器决定。
 
-退出码：0 正常；1 参数或读取错误；2 缺字体未获允许；3 缺依赖；
-        4 文档已生成但页码设置失败。
+退出码：0 正常；1 参数、读取或写入错误；2 缺字体未获允许；3 缺依赖；
+        4 文档已生成但页码设置失败；5 字体检测不可用，未获允许。
 """
 
 from __future__ import annotations
@@ -84,30 +90,38 @@ def _strip_font_suffix(name: str) -> str:
     return name.strip()
 
 
-def installed_fonts() -> tuple[set[str], set[str]]:
-    """返回 (已安装字体名集合, 已安装字体文件名主干集合)。"""
+def installed_fonts() -> tuple[set[str], set[str], list[str]]:
+    """返回 (已安装字体名集合, 已安装字体文件名主干集合, 检测失败原因列表)。"""
     names: set[str] = set()
     files: set[str] = set()
+    errors: list[str] = []
 
-    if sys.platform == "win32":
-        try:
-            import winreg
-        except ImportError:
-            winreg = None  # type: ignore
-        if winreg is not None:
-            sub = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
-            for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
-                try:
-                    with winreg.OpenKey(root, sub) as key:
-                        count = winreg.QueryInfoKey(key)[1]
-                        for i in range(count):
-                            name, value, _ = winreg.EnumValue(key, i)
-                            names.add(_strip_font_suffix(str(name)))
-                            base = os.path.splitext(os.path.basename(str(value)))[0]
-                            if base:
-                                files.add(base.upper())
-                except OSError:
-                    continue
+    if sys.platform != "win32":
+        errors.append("当前平台 %s 不是 Windows，读不到字体注册表和 Windows 字体目录"
+                      % sys.platform)
+        return names, files, errors
+
+    try:
+        import winreg
+    except ImportError:
+        winreg = None  # type: ignore
+    if winreg is not None:
+        sub = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"
+        for root, root_name in ((winreg.HKEY_LOCAL_MACHINE, "HKLM（本机）"),
+                                (winreg.HKEY_CURRENT_USER, "HKCU（当前用户）")):
+            try:
+                with winreg.OpenKey(root, sub) as key:
+                    count = winreg.QueryInfoKey(key)[1]
+                    for i in range(count):
+                        name, value, _ = winreg.EnumValue(key, i)
+                        names.add(_strip_font_suffix(str(name)))
+                        base = os.path.splitext(os.path.basename(str(value)))[0]
+                        if base:
+                            files.add(base.upper())
+            except OSError as exc:
+                errors.append("读注册表 %s 失败：%s" % (root_name, exc))
+    else:
+        errors.append("当前 Python 没有 winreg 模块，读不到字体注册表")
 
     # 字体目录兜底（用户自装字体有时没进注册表）
     win_dir = os.environ.get("WINDIR", r"C:\Windows")
@@ -121,14 +135,22 @@ def installed_fonts() -> tuple[set[str], set[str]]:
                 base = os.path.splitext(fn)[0]
                 if base:
                     files.add(base.upper())
-        except OSError:
-            continue
+        except OSError as exc:
+            errors.append("读字体目录 %s 失败：%s" % (d, exc))
 
-    return names, files
+    return names, files, errors
 
 
-def find_missing_fonts() -> list[tuple[str, str]]:
-    names, files = installed_fonts()
+def find_missing_fonts() -> tuple[list[tuple[str, str]], str | None]:
+    """返回 (缺失字体, 检测不可用的原因)。
+
+    原因是 None 表示检测生效、结论可信；非 None 表示一条字体信息都没读到，
+    此时「缺失」只是全部必需字体，不代表真的没装。
+    """
+    names, files, errors = installed_fonts()
+    if not names and not files:
+        reason = "；".join(errors) if errors else "没有读到任何已安装字体"
+        return [(font, role) for font, role in REQUIRED_FONTS], reason
     missing: list[tuple[str, str]] = []
     for font, role in REQUIRED_FONTS:
         if font in names or font.lower() in {n.lower() for n in names}:
@@ -137,7 +159,7 @@ def find_missing_fonts() -> list[tuple[str, str]]:
         if hints & files:
             continue
         missing.append((font, role))
-    return missing
+    return missing, None
 
 
 # ---------------------------------------------------------------- docx 依赖
@@ -180,7 +202,7 @@ def make_helpers(Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, OxmlElement, qn,
 
     def add_par(doc, text="", *, font=FONT_BODY, size=None, align=None,
                 indent_chars=INDENT_CHARS, left_chars=0.0, right_chars=0.0,
-                bold=False):
+                hanging_chars=0.0, bold=False):
         if size is None:
             size = Pt(SIZE_BODY)
         p = doc.add_paragraph()
@@ -192,13 +214,16 @@ def make_helpers(Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, OxmlElement, qn,
         if align is not None:
             p.alignment = align
         # 先用 pt 值把 w:ind 建出来（保证 pPr 里顺序合法），再补字符值
-        pf.first_line_indent = Pt(indent_chars * SIZE_BODY)
-        if left_chars:
-            pf.left_indent = Pt(left_chars * SIZE_BODY)
+        # hanging_chars：续行比首行多缩进的字数（附件说明用）
+        pf.first_line_indent = Pt((indent_chars - hanging_chars) * SIZE_BODY)
+        if left_chars or hanging_chars:
+            pf.left_indent = Pt((left_chars + hanging_chars) * SIZE_BODY)
         if right_chars:
             pf.right_indent = Pt(right_chars * SIZE_BODY)
-        if indent_chars:
+        if indent_chars and not hanging_chars:
             _set_ind_attr(p, "w:firstLineChars", int(indent_chars * 100))
+        if hanging_chars:
+            _set_ind_attr(p, "w:hangingChars", int(hanging_chars * 100))
         if left_chars:
             _set_ind_attr(p, "w:leftChars", int(left_chars * 100))
         if right_chars:
@@ -265,7 +290,11 @@ def make_helpers(Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING, OxmlElement, qn,
         return [field_run(begin), field_run(separate), field_run(end)]
 
     def add_page_numbers(doc, section, hide_first_page=False):
-        """写入奇偶页页码；返回失败项列表，空列表表示全部成功。"""
+        """写入奇偶页页码；返回失败项列表，空列表表示全部成功。
+
+        「单/双页居右、居左空一字」里的「一字」按正文字号（3 号 = 16 pt）计宽，
+        与首行缩进同一把尺子；页码本身是 4 号字，两者口径不同，此处取正文口径。
+        """
         problems = []
         try:
             doc.settings.odd_and_even_pages_header_footer = True
@@ -351,24 +380,33 @@ def parse_body(text: str):
         if not line.strip():
             flush()
             continue
-        if line.startswith("### "):
+        if line.startswith("\\#"):
+            # 转义：正文行首真要写 # 时用 \#，这里吃掉反斜杠
+            line = line[1:]
+        elif line.startswith("#### "):
+            flush()
+            blocks.append(("h4", line[5:].strip()))
+            continue
+        elif line.startswith("### "):
             flush()
             blocks.append(("h3", line[4:].strip()))
+            continue
         elif line.startswith("## "):
             flush()
             blocks.append(("h2", line[3:].strip()))
+            continue
         elif line.startswith("# "):
             flush()
             blocks.append(("h1", line[2:].strip()))
+            continue
+        piece = line.strip()
+        if has_blank:
+            if buf and _needs_space(buf[-1][-1:], piece[:1]):
+                buf.append(" ")
+            buf.append(piece)
         else:
-            piece = line.strip()
-            if has_blank:
-                if buf and _needs_space(buf[-1][-1:], piece[:1]):
-                    buf.append(" ")
-                buf.append(piece)
-            else:
-                buf.append(piece)
-                flush()
+            buf.append(piece)
+            flush()
     flush()
     return blocks
 
@@ -402,10 +440,12 @@ def validate_args(args) -> tuple[list[str], list[str]]:
 
     if not args.out.lower().endswith(".docx"):
         errors.append("--out 必须以 .docx 结尾：%s" % args.out)
+    if not (args.title or "").strip():
+        errors.append("--title 不能是空白")
     if args.date and not _valid_date(args.date):
         errors.append("--date 应为「YYYY 年 M 月 D 日」且日期真实存在：%s" % args.date)
-    if args.to and not args.to.rstrip().endswith("："):
-        notices.append("--to 建议以全角冒号「：」结尾：%s" % args.to)
+    if args.to and args.to.strip() and not args.to.rstrip().endswith("："):
+        errors.append("--to 应以全角冒号「：」结尾（主送机关后是冒号）：%s" % args.to)
     if args.body and not os.path.isfile(args.body):
         errors.append("正文文件不存在：%s" % args.body)
     for item in args.attach or []:
@@ -415,6 +455,17 @@ def validate_args(args) -> tuple[list[str], list[str]]:
 
 
 # ---------------------------------------------------------------- 主流程
+
+def _display_path(path: str) -> str:
+    """日志里用的短路径：能相对当前目录就相对，否则只留文件名。"""
+    try:
+        rel = os.path.relpath(os.path.abspath(path))
+    except (ValueError, OSError):
+        return os.path.basename(path)
+    if rel.startswith(".."):
+        return os.path.basename(path)
+    return rel
+
 
 def build_document(args):
     (Document, WD_ALIGN_PARAGRAPH, WD_LINE_SPACING,
@@ -443,7 +494,10 @@ def build_document(args):
             with open(args.body, "r", encoding="utf-8-sig") as fh:
                 body_text = fh.read()
         except OSError as exc:
-            print("读不到正文文件 %s：%s" % (args.body, exc), file=sys.stderr)
+            print("读不到正文文件 %s：%s" % (_display_path(args.body), exc), file=sys.stderr)
+            raise SystemExit(1)
+        if not body_text.strip():
+            print("正文文件是空的：%s" % _display_path(args.body), file=sys.stderr)
             raise SystemExit(1)
     blocks = parse_body(body_text)
     if blocks:
@@ -453,21 +507,24 @@ def build_document(args):
             add_par(doc, text, font=FONT_H1)
         elif kind == "h2":
             add_par(doc, text, font=FONT_H2)
-        elif kind == "h3":
+        elif kind in ("h3", "h4"):
+            # 三、四级标题字体同正文，区别只在于独立成段
             add_par(doc, text, font=FONT_H3)
         else:
             add_par(doc, text, font=FONT_BODY)
 
-    # 附件说明：正文下空 1 行，左空 2 字
+    # 附件说明：正文下空 1 行，左空 2 字；续行与附件名称首字对齐
     if args.attach:
         blank_line(doc, 1)
-        first = True
-        for item in args.attach:
+        for idx, item in enumerate(args.attach):
             text = strip_attach_prefix(item)
-            label = "附件：%s" % text if first else text
-            add_par(doc, label, font=FONT_BODY,
-                    indent_chars=0, left_chars=INDENT_CHARS)
-            first = False
+            if idx == 0:
+                # 「附件：」占 3 字，悬挂 3 字让第 2 行起对齐到「1.」
+                add_par(doc, "附件：%s" % text, font=FONT_BODY,
+                        indent_chars=0, left_chars=INDENT_CHARS, hanging_chars=3.0)
+            else:
+                add_par(doc, text, font=FONT_BODY,
+                        indent_chars=0, left_chars=INDENT_CHARS + 3.0)
 
     # 发文机关署名 + 成文日期：附件说明下空 1 行；日期右空 4 字，署名居中于日期
     if args.sign or args.date:
@@ -494,11 +551,6 @@ def build_document(args):
         add_par(doc, note, font=FONT_BODY, indent_chars=0, left_chars=INDENT_CHARS)
 
     page_problems = add_page_numbers(doc, section, hide_first_page=args.hide_first_page_number)
-
-    out_dir = os.path.dirname(os.path.abspath(args.out))
-    if out_dir and not os.path.isdir(out_dir):
-        os.makedirs(out_dir, exist_ok=True)
-    doc.save(args.out)
     return doc, blocks, page_problems
 
 
@@ -530,7 +582,12 @@ def main(argv=None):
     args = parser.parse_args(argv)
 
     if args.check_fonts:
-        missing = find_missing_fonts()
+        missing, detect_error = find_missing_fonts()
+        if detect_error:
+            print("字体检测不可用：%s" % detect_error, file=sys.stderr)
+            print("无法确认字体是否齐全。确认已装好后，加 --force（别名 "
+                  "--allow-missing-fonts）可跳过检查。", file=sys.stderr)
+            return 5
         if not missing:
             print("字体齐全：方正小标宋简体 / 仿宋_GB2312 / 楷体_GB2312 / 黑体 / 宋体")
             return 0
@@ -541,8 +598,8 @@ def main(argv=None):
               "但脚本不会替换字体名，显示效果由打开文档的机器决定。")
         return 2
 
-    if not args.out or not args.title:
-        parser.error("生成文档需要同时提供 --out 和 --title")
+    if not args.out:
+        parser.error("生成文档需要 --out")
 
     errors, notices = validate_args(args)
     for note in notices:
@@ -552,8 +609,16 @@ def main(argv=None):
             print("参数错误：%s" % err, file=sys.stderr)
         return 1
 
-    missing = find_missing_fonts()
-    if missing:
+    missing, detect_error = find_missing_fonts()
+    if detect_error:
+        print("字体检测不可用：%s" % detect_error, file=sys.stderr)
+        if not args.force:
+            print("无法确认字体是否齐全，已停止。确认已装好后加 --force 继续。",
+                  file=sys.stderr)
+            return 5
+        print("已按 --force 继续：字体检查结果不可信，请自行确认字体已装。",
+              file=sys.stderr)
+    elif missing:
         print("缺少以下公文字体（共 %d 项）：" % len(missing), file=sys.stderr)
         for font, role in missing:
             print("  - %-18s（用于%s）" % (font, role), file=sys.stderr)
@@ -564,13 +629,31 @@ def main(argv=None):
               "打开时替代显示，实际效果不可控。", file=sys.stderr)
 
     doc, blocks, page_problems = build_document(args)
-    print("已生成：%s" % os.path.abspath(args.out))
+
+    tmp_path = args.out + ".tmp"
+    out_dir = os.path.dirname(os.path.abspath(args.out))
+    try:
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        doc.save(tmp_path)
+        os.replace(tmp_path, args.out)
+    except OSError as exc:
+        print("写入失败：%s（目标 %s）" % (exc, _display_path(args.out)), file=sys.stderr)
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        return 1
+
+    print("已生成：%s" % _display_path(args.out))
     print("版式：A4，页边距 上%d/下%d/左%d/右%d mm，固定行距 %d 磅，每页 22 行"
           % (MM_TOP, MM_BOTTOM, MM_LEFT, MM_RIGHT, LINE_PITCH_PT))
     print("正文段数：%d" % len(blocks))
     print("字体：标题 %s %dpt｜正文 %s %dpt｜页码 %s %dpt"
           % (FONT_TITLE, SIZE_TITLE, FONT_BODY, SIZE_BODY, FONT_PAGE, SIZE_PAGE))
-    if missing:
+    if detect_error:
+        print("注意：字体未做检查（检测不可用），文档内仍按规范字体名写入。")
+    elif missing:
         print("注意：下列字体缺失，文档内仍按规范字体名写入（打开时由系统替代）：%s"
               % "、".join(f for f, _ in missing))
     if page_problems:
