@@ -19,6 +19,7 @@ SKILL.md                 # 技能本体：参数表、结构规则、自检清�
 scripts/gongwen_docx.py  # 参考实现，一条命令生成合规 .docx
 tests/                   # 回归测试（unittest，不依赖真实字体）
 requirements.txt         # 运行与测试依赖
+.github/workflows/       # CI：Linux + Windows 跑 unittest
 ```
 
 ## 安装
