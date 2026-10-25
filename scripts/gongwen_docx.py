@@ -105,6 +105,13 @@ def _os_error_text(exc: OSError) -> str:
     return exc.strerror or exc.__class__.__name__
 
 
+def _error_text(exc: BaseException) -> str:
+    """清理阶段的错误描述。非 OSError 只留类名：异常消息里可能带本机路径。"""
+    if isinstance(exc, OSError):
+        return exc.strerror or exc.__class__.__name__
+    return exc.__class__.__name__
+
+
 def _strip_font_suffix(name: str) -> str:
     for suffix in (" (TrueType)", " (OpenType)", " (TrueType)"):
         if name.endswith(suffix):
@@ -681,9 +688,10 @@ def main(argv=None):
             return
         try:
             os.unlink(tmp_path)
-        except OSError as cleanup_exc:
+        except Exception as cleanup_exc:
+            # 清理本身出错只提醒，绝不替换掉真正的异常（下面 except 块里会原样抛出）
             print("提醒：临时文件没清掉：%s（%s）"
-                  % (_display_path(tmp_path), _os_error_text(cleanup_exc)),
+                  % (_display_path(tmp_path), _error_text(cleanup_exc)),
                   file=sys.stderr)
 
     try:

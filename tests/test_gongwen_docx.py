@@ -224,6 +224,42 @@ class ExitCodeTest(unittest.TestCase):
         self.assertIn("没有这个正文.txt", err.getvalue())
         self.assertNotIn("someone", err.getvalue())
 
+    def test_out_path_error_hides_absolute_path(self):
+        # --out 的报错同样要脱敏：这条分支此前没有测试盯着
+        secret = os.path.join(os.sep, "Users", "someone", "错误的文件名.txt")
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gw.main(["--out", secret, "--title", "t"])
+        self.assertEqual(code, 1)
+        self.assertIn("--out 必须以 .docx 结尾", err.getvalue())
+        self.assertIn("错误的文件名.txt", err.getvalue())
+        self.assertNotIn("someone", err.getvalue())
+
+    def test_unexpected_save_error_with_cleanup_failure_keeps_original(self):
+        # 保存抛 ValueError、清理又抛非 OSError：抛出来的必须还是原始 Exception
+        def fake_build(args):
+            def boom(path):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+                raise ValueError("内部炸了")
+
+            doc = mock.Mock()
+            doc.save = boom
+            return doc, [], []
+
+        out = os.path.join(self.tmp, "x.docx")
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                mock.patch.object(gw, "build_document", side_effect=fake_build), \
+                mock.patch("os.unlink", side_effect=RuntimeError("清理也炸了")), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            with self.assertRaises(ValueError):
+                gw.main(["--out", out, "--title", "t"])
+        text = err.getvalue()
+        self.assertIn("临时文件没清掉", text)
+        self.assertIn("RuntimeError", text)
+        self.assertNotIn(self.tmp, text)
+        self.assertFalse(os.path.exists(out))
+
     def test_save_error_returns_1_cleans_temp_and_hides_path(self):
         def fake_build(args):
             def boom(path):
