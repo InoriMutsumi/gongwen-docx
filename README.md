@@ -110,4 +110,4 @@ python scripts/gongwen_docx.py --check-fonts
 
 ## 许可
 
-仓库未附带许可证文件。要正式引用或二次分发，请先开个 issue 聊一下。
+MIT，见 [LICENSE](LICENSE)。
