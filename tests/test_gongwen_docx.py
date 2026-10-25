@@ -154,6 +154,17 @@ class ExitCodeTest(unittest.TestCase):
             self._main(["--out", os.path.join(self.tmp, "x.docx"), "--title", "t", "--body", body])
         self.assertEqual(ctx.exception.code, 1)
 
+    def test_non_utf8_body_exits_1_without_traceback(self):
+        body = os.path.join(self.tmp, "gbk.txt")
+        with open(body, "wb") as fh:
+            fh.write("正文".encode("gbk"))
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                self.assertRaises(SystemExit) as ctx:
+            self._main(["--out", os.path.join(self.tmp, "x.docx"), "--title", "t", "--body", body])
+        self.assertEqual(ctx.exception.code, 1)
+        self.assertIn("UTF-8", err.getvalue())
+        self.assertNotIn(self.tmp, err.getvalue())
+
     def test_page_problem_returns_4(self):
         def fake_build(args):
             def fake_save(path):

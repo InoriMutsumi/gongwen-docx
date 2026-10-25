@@ -523,8 +523,13 @@ def build_document(args):
         try:
             with open(args.body, "r", encoding="utf-8-sig") as fh:
                 body_text = fh.read()
+        except UnicodeDecodeError:
+            print("正文文件不是 UTF-8 编码：%s（用记事本「另存为」选 UTF-8 再试）"
+                  % _display_path(args.body), file=sys.stderr)
+            raise SystemExit(1)
         except OSError as exc:
-            print("读不到正文文件 %s：%s" % (_display_path(args.body), exc), file=sys.stderr)
+            print("读不到正文文件 %s：%s" % (_display_path(args.body), _os_error_text(exc)),
+                  file=sys.stderr)
             raise SystemExit(1)
         if not body_text.strip():
             print("正文文件是空的：%s" % _display_path(args.body), file=sys.stderr)
