@@ -185,10 +185,44 @@ class ExitCodeTest(unittest.TestCase):
             doc.save = fake_save
             return doc, [], ["页码炸了"]
 
+        out = os.path.join(self.tmp, "x.docx")
         with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
                 mock.patch.object(gw, "build_document", side_effect=fake_build):
-            code = gw.main(["--out", os.path.join(self.tmp, "x.docx"), "--title", "t"])
+            code = gw.main(["--out", out, "--title", "t"])
         self.assertEqual(code, 4)
+        # 退出码 4 的语义是「文档已生成，只是页码没写进去」，文件必须真的在
+        self.assertTrue(os.path.isfile(out), "返回 4 但目标文件不存在")
+
+    def test_unexpected_save_error_cleans_temp_and_reraises(self):
+        def fake_build(args):
+            def boom(path):
+                with open(path, "wb") as fh:
+                    fh.write(b"x")
+                raise ValueError("内部炸了")
+
+            doc = mock.Mock()
+            doc.save = boom
+            return doc, [], []
+
+        out = os.path.join(self.tmp, "x.docx")
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                mock.patch.object(gw, "build_document", side_effect=fake_build):
+            with self.assertRaises(ValueError):
+                gw.main(["--out", out, "--title", "t"])
+        # 非 OSError 的意外：临时文件照样清掉，异常原样抛出（不被吞）
+        self.assertEqual([n for n in os.listdir(self.tmp) if n.endswith(".tmp")], [])
+        self.assertFalse(os.path.exists(out))
+
+    def test_validate_error_hides_absolute_path(self):
+        secret = os.path.join(os.sep, "Users", "someone", "没有这个正文.txt")
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            code = gw.main(["--out", os.path.join(self.tmp, "x.docx"),
+                            "--title", "t", "--body", secret])
+        self.assertEqual(code, 1)
+        self.assertIn("正文文件不存在", err.getvalue())
+        self.assertIn("没有这个正文.txt", err.getvalue())
+        self.assertNotIn("someone", err.getvalue())
 
     def test_save_error_returns_1_cleans_temp_and_hides_path(self):
         def fake_build(args):
@@ -418,6 +452,53 @@ class FontPartialDetectionTest(unittest.TestCase):
     def test_nothing_read_at_all_is_detect_error(self):
         with mock.patch.object(gw, "installed_fonts",
                                return_value=(set(), set(), ["读注册表失败：拒绝访问"])):
+            missing, detect_error = gw.find_missing_fonts()
+        self.assertIsNotNone(detect_error)
+        self.assertEqual(len(missing), len(gw.REQUIRED_FONTS))
+
+
+class InstalledFontsSourceTest(unittest.TestCase):
+    """不桩 installed_fonts 本身，改为桩它下面真正的来源（winreg / listdir）。"""
+
+    def _fake_winreg(self, openkey_error):
+        fake = mock.MagicMock()
+        fake.HKEY_LOCAL_MACHINE = "HKLM"
+        fake.HKEY_CURRENT_USER = "HKCU"
+        fake.OpenKey.side_effect = openkey_error
+        return fake
+
+    def test_registry_error_but_font_dir_readable(self):
+        fake = self._fake_winreg(OSError(5, "拒绝访问"))
+        with mock.patch.object(gw.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": fake}), \
+                mock.patch.object(gw.os, "listdir", return_value=["simfang.ttf"]):
+            names, files, errors = gw.installed_fonts()
+        self.assertEqual(names, set())
+        self.assertIn("SIMFANG", files)
+        self.assertTrue(any("读注册表" in e for e in errors))
+        self.assertFalse(any("读系统字体目录" in e for e in errors))
+
+    def test_registry_ok_fills_names(self):
+        fake = mock.MagicMock()
+        fake.HKEY_LOCAL_MACHINE = "HKLM"
+        fake.HKEY_CURRENT_USER = "HKCU"
+        key = mock.MagicMock()
+        fake.OpenKey.return_value.__enter__.return_value = key
+        fake.QueryInfoKey.return_value = (0, 1, 0)
+        fake.EnumValue.return_value = ("黑体 (TrueType)", "simhei.ttf", 1)
+        with mock.patch.object(gw.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": fake}), \
+                mock.patch.object(gw.os, "listdir", return_value=[]):
+            names, files, errors = gw.installed_fonts()
+        self.assertIn("黑体", names)
+        self.assertIn("SIMHEI", files)
+        self.assertEqual(errors, [])
+
+    def test_all_sources_fail_is_detect_error(self):
+        fake = self._fake_winreg(OSError(5, "拒绝访问"))
+        with mock.patch.object(gw.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": fake}), \
+                mock.patch.object(gw.os, "listdir", side_effect=OSError(3, "路径不存在")):
             missing, detect_error = gw.find_missing_fonts()
         self.assertIsNotNone(detect_error)
         self.assertEqual(len(missing), len(gw.REQUIRED_FONTS))

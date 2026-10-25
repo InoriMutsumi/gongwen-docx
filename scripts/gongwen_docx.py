@@ -467,7 +467,7 @@ def validate_args(args) -> tuple[list[str], list[str]]:
     notices: list[str] = []
 
     if not args.out.lower().endswith(".docx"):
-        errors.append("--out 必须以 .docx 结尾：%s" % args.out)
+        errors.append("--out 必须以 .docx 结尾：%s" % _display_path(args.out))
     if not (args.title or "").strip():
         errors.append("--title 不能是空白")
     if args.date and not _valid_date(args.date):
@@ -477,7 +477,7 @@ def validate_args(args) -> tuple[list[str], list[str]]:
     elif args.to and not args.to.rstrip().endswith("："):
         errors.append("--to 应以全角冒号「：」结尾（主送机关后是冒号）：%s" % args.to)
     if args.body and not os.path.isfile(args.body):
-        errors.append("正文文件不存在：%s" % args.body)
+        errors.append("正文文件不存在：%s" % _display_path(args.body))
     for item in args.attach or []:
         if item.strip().startswith(("附件：", "附件:")):
             notices.append("--attach 自带的「附件：」已去掉，避免重复：%s" % item)
@@ -613,7 +613,9 @@ def main(argv=None):
     parser.add_argument("--out", help="输出 .docx 路径")
     parser.add_argument("--title", help="标题")
     parser.add_argument("--to", help="主送机关，如「各处室：」")
-    parser.add_argument("--body", help="正文纯文本文件（支持 # / ## / ### 层级）")
+    parser.add_argument("--body",
+                        help="正文纯文本文件（支持 # / ## / ### / #### 层级，"
+                             "\\# 转义行首井号）")
     parser.add_argument("--sign", help="发文机关署名")
     parser.add_argument("--date", help="成文日期，如 2025年10月25日")
     parser.add_argument("--attach", action="append", help="附件说明，可重复")
@@ -673,6 +675,17 @@ def main(argv=None):
 
     out_dir = os.path.dirname(os.path.abspath(args.out))
     tmp_path = ""
+
+    def _cleanup_tmp() -> None:
+        if not tmp_path:
+            return
+        try:
+            os.unlink(tmp_path)
+        except OSError as cleanup_exc:
+            print("提醒：临时文件没清掉：%s（%s）"
+                  % (_display_path(tmp_path), _os_error_text(cleanup_exc)),
+                  file=sys.stderr)
+
     try:
         if out_dir:
             os.makedirs(out_dir, exist_ok=True)
@@ -686,14 +699,13 @@ def main(argv=None):
     except OSError as exc:
         print("写入失败：%s（目标 %s）" % (_os_error_text(exc), _display_path(args.out)),
               file=sys.stderr)
-        if tmp_path:
-            try:
-                os.unlink(tmp_path)
-            except OSError as cleanup_exc:
-                print("提醒：临时文件没清掉：%s（%s）"
-                      % (_display_path(tmp_path), _os_error_text(cleanup_exc)),
-                      file=sys.stderr)
+        _cleanup_tmp()
         return 1
+    except BaseException:
+        # 不是 OSError 的意外（python-docx 内部异常等）也要清掉临时文件，
+        # 再把异常原样抛出去——吞掉的话真正的 bug 就再也没人知道了。
+        _cleanup_tmp()
+        raise
 
     print("已生成：%s" % _display_path(args.out))
     print("版式：A4，页边距 上%d/下%d/左%d/右%d mm，固定行距 %d 磅，每页 22 行"
