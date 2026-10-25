@@ -549,14 +549,14 @@ def build_document(args):
             add_par(doc, text, font=FONT_BODY)
 
     # 附件说明：正文下空 1 行，左空 2 字；续行与附件名称首字对齐
-    if args.attach:
+    # 先滤掉空白项再决定要不要空行：整组都是空白时不该在正文后留一个空段
+    attach_items = [text for text in
+                    (strip_attach_prefix(item) for item in (args.attach or []))
+                    if text]
+    if attach_items:
         blank_line(doc, 1)
-        shown = 0
-        for item in args.attach:
-            text = strip_attach_prefix(item)
-            if not text:
-                continue
-            if shown == 0:
+        for idx, text in enumerate(attach_items):
+            if idx == 0:
                 # 「附件：」占 3 字，悬挂 3 字让第 2 行起对齐到「1.」
                 add_par(doc, "附件：%s" % text, font=FONT_BODY,
                         indent_chars=0, left_chars=INDENT_CHARS, hanging_chars=3.0)
@@ -565,7 +565,6 @@ def build_document(args):
                 add_par(doc, text, font=FONT_BODY,
                         indent_chars=0, left_chars=INDENT_CHARS + 3.0,
                         hanging_chars=1.5)
-            shown += 1
 
     # 发文机关署名 + 成文日期：附件说明下空 1 行；日期右空 4 字，署名居中于日期
     if args.sign or args.date:
