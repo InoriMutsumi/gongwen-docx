@@ -8,6 +8,7 @@ import contextlib
 import io
 import os
 import shutil
+import struct
 import sys
 import tempfile
 import types
@@ -66,6 +67,39 @@ class ParseBodyTest(unittest.TestCase):
     def test_chinese_join_has_no_space(self):
         self.assertEqual(gw.parse_body("第一行\n第二行\n\n尾段\n"),
                          [("p", "第一行第二行"), ("p", "尾段")])
+
+    def test_dash_list_items_each_become_one_paragraph(self):
+        blocks = gw.parse_body("- 第一条\n- 第二条\n\n尾段\n")
+        self.assertEqual(blocks, [("p", "第一条"), ("p", "第二条"), ("p", "尾段")])
+
+    def test_numbered_list_items_each_become_one_paragraph(self):
+        blocks = gw.parse_body("1. 甲\n2. 乙\n\n尾段\n")
+        self.assertEqual([b[1] for b in blocks], ["甲", "乙", "尾段"])
+
+    def test_paren_list_markers_are_stripped(self):
+        blocks = gw.parse_body("（1）甲\n（一）乙\n\n尾段\n")
+        self.assertEqual([b[1] for b in blocks], ["甲", "乙", "尾段"])
+
+    def test_list_items_work_without_any_blank_line(self):
+        blocks = gw.parse_body("- 甲\n- 乙\n")
+        self.assertEqual([b[1] for b in blocks], ["甲", "乙"])
+
+    def test_decimal_is_not_mistaken_for_a_list_item(self):
+        # 「1.5」的「1.」后面跟的是数字，不是列表项前缀
+        self.assertEqual(gw.parse_body("1.5 倍行距\n2.0 倍上限\n\n尾段\n"),
+                         [("p", "1.5 倍行距2.0 倍上限"), ("p", "尾段")])
+
+    def test_list_marker_escape_keeps_the_marker(self):
+        self.assertEqual(gw.parse_body("\\- 这不是列表\n"), [("p", "- 这不是列表")])
+
+    def test_trailing_backslash_forces_its_own_paragraph(self):
+        self.assertEqual(gw.parse_body("Yours sincerely,\\\nLi Ming\n\n尾段\n"),
+                         [("p", "Yours sincerely,"), ("p", "Li Ming"), ("p", "尾段")])
+
+    def test_double_backslash_is_not_a_hard_break(self):
+        # 正文真要写反斜杠时用两个，不该被当成强制换行
+        self.assertEqual(gw.parse_body("结尾是双反斜杠\\\\\n下一行\n\n尾段\n"),
+                         [("p", "结尾是双反斜杠\\\\下一行"), ("p", "尾段")])
 
 
 class TextUtilTest(unittest.TestCase):
@@ -384,6 +418,19 @@ class GenerateTest(unittest.TestCase):
         self.assertEqual(ind.get(qn("w:firstLineChars")), "200")
         self.assertAlmostEqual(body.paragraph_format.line_spacing.pt, 29, places=1)
 
+    def test_western_runs_use_times_new_roman(self):
+        """成品文档里，凡是带英文数字的 run，ascii/hAnsi 都必须是 Times New Roman。"""
+        doc = self._generate("第 3 条共 8 项，DeepSeek Harness 是工具名。\n")
+        checked = 0
+        for par in doc.paragraphs:
+            if not par.runs or not par.text.strip():
+                continue
+            rfonts = par.runs[0]._element.rPr.rFonts
+            self.assertEqual(rfonts.get(qn("w:ascii")), "Times New Roman", par.text)
+            self.assertEqual(rfonts.get(qn("w:hAnsi")), "Times New Roman", par.text)
+            checked += 1
+        self.assertGreater(checked, 0)
+
     def test_heading_fonts(self):
         doc = self._generate("# 一、总体要求\n\n## （一）主要任务\n\n### 1. 第一项\n\n#### （1）细节\n")
         fonts = {p.text: p.runs[0]._element.rPr.rFonts.get(qn("w:eastAsia"))
@@ -476,7 +523,8 @@ class FontPartialDetectionTest(unittest.TestCase):
     def test_partial_failure_warns_but_stays_below_exit_5(self):
         def fake_installed():
             # 注册表读失败、字体目录正常：结论不可信，但还没到「检测不可用」
-            return set(), {"SIMFANG", "SIMKAI"}, ["读注册表 HKLM（本机）失败：拒绝访问"]
+            return gw.FontScan(set(), {"SIMFANG", "SIMKAI"}, [],
+                               ["读注册表 HKLM（本机）失败：拒绝访问"])
 
         with mock.patch.object(gw, "installed_fonts", side_effect=fake_installed), \
                 contextlib.redirect_stderr(io.StringIO()) as err:
@@ -486,58 +534,255 @@ class FontPartialDetectionTest(unittest.TestCase):
         self.assertIn("字体检测不完整", err.getvalue())
 
     def test_nothing_read_at_all_is_detect_error(self):
-        with mock.patch.object(gw, "installed_fonts",
-                               return_value=(set(), set(), ["读注册表失败：拒绝访问"])):
+        with mock.patch.object(
+                gw, "installed_fonts",
+                return_value=gw.FontScan(set(), set(), [], ["读注册表失败：拒绝访问"])):
             missing, detect_error = gw.find_missing_fonts()
         self.assertIsNotNone(detect_error)
         self.assertEqual(len(missing), len(gw.REQUIRED_FONTS))
 
+    def test_name_table_rescues_font_with_odd_filename(self):
+        """方正小标宋简体装成 FZXBSJW.TTF，注册表和文件名都认不出，靠 name 表翻案。"""
+        scan = gw.FontScan(set(), {"FZXBSJW"}, ["/fake/FZXBSJW.TTF"], [])
+        with mock.patch.object(gw, "installed_fonts", return_value=scan), \
+                mock.patch.object(gw, "_font_names_from_file",
+                                  return_value=frozenset({"方正小标宋简体"})):
+            missing, detect_error = gw.find_missing_fonts()
+        self.assertIsNone(detect_error)
+        self.assertNotIn("方正小标宋简体", [font for font, _ in missing])
+
+    def test_no_parse_when_scan_already_sufficient(self):
+        """名字全对得上时不该再去翻字体文件——解析 name 表是慢路径。"""
+        scan = gw.FontScan({font for font, _ in gw.REQUIRED_FONTS}, set(), [], [])
+        with mock.patch.object(gw, "installed_fonts", return_value=scan), \
+                mock.patch.object(gw, "_font_names_from_file") as parse:
+            missing, _ = gw.find_missing_fonts()
+        self.assertEqual(missing, [])
+        parse.assert_not_called()
+
+
+class FontNameTableTest(unittest.TestCase):
+    """_parse_name_table / _norm_font_name / _gdi_font_families 这类底层解析。
+
+    只造最小二进制，不依赖本机装了什么字体，CI 上也能跑。
+    """
+
+    @staticmethod
+    def _build_sfnt(names):
+        """按 name 表结构拼一个最小 sfnt。
+
+        names 是 [(platform, encoding, language, nameID, text)]；text 由调用方
+        决定该用 utf-16-be 还是 mac_roman 编码。
+        """
+        records = b""
+        strings = b""
+        for platform, encoding, language, name_id, blob in names:
+            records += struct.pack(">HHHHHH", platform, encoding, language,
+                                   name_id, len(blob), len(strings))
+            strings += blob
+        header = struct.pack(">HHH", 0, len(names), 6 + len(records))
+        return header + records + strings
+
+    def test_reads_utf16_chinese_name(self):
+        blob = "方正小标宋简体".encode("utf-16-be")
+        table = self._build_sfnt([(3, 1, 0x804, 1, blob), (3, 1, 0x804, 4, blob)])
+        self.assertEqual(gw._parse_name_table(table), {"方正小标宋简体"})
+
+    def test_reads_latin_name_from_mac_roman(self):
+        table = self._build_sfnt([(1, 0, 0, 1, b"Times New Roman")])
+        self.assertEqual(gw._parse_name_table(table), {"Times New Roman"})
+
+    def test_truncated_table_returns_empty(self):
+        blob = "黑体".encode("utf-16-be")
+        table = self._build_sfnt([(3, 1, 0x804, 1, blob)])
+        self.assertEqual(gw._parse_name_table(table[:-6]), set())
+
+    def test_normalisation_ignores_space_case_and_suffix(self):
+        self.assertEqual(gw._norm_font_name("Times New Roman"),
+                         gw._norm_font_name("times_new-roman"))
+        self.assertEqual(gw._norm_font_name("黑体"), gw._norm_font_name("黑 体"))
+
+    def test_gdi_off_on_non_windows(self):
+        with mock.patch.object(gw.sys, "platform", "linux"):
+            self.assertEqual(gw._gdi_font_families(), set())
+
 
 class InstalledFontsSourceTest(unittest.TestCase):
-    """不桩 installed_fonts 本身，改为桩它下面真正的来源（winreg / listdir）。"""
+    """不桩 installed_fonts 本身，改为桩它下面真正的来源（winreg / listdir / GDI）。"""
 
     def _fake_winreg(self, openkey_error):
         fake = mock.MagicMock()
         fake.HKEY_LOCAL_MACHINE = "HKLM"
         fake.HKEY_CURRENT_USER = "HKCU"
+        # 三套视图的位标志要是整数，否则 base_flags | ... 出来的是 MagicMock
+        fake.KEY_READ = 0x20019
+        fake.KEY_WOW64_64KEY = 0x0100
+        fake.KEY_WOW64_32KEY = 0x0200
         fake.OpenKey.side_effect = openkey_error
         return fake
 
+    def _installed_with(self, fake_reg, listdir):
+        """在打桩 winreg / listdir / GDI 的前提下跑一次 installed_fonts。
+
+        GDI 必须一起桩掉：本机真实存在字体，不桩的话「全部失败」的用例永远
+        撞上非空结果。
+        """
+        with mock.patch.object(gw.sys, "platform", "win32"), \
+                mock.patch.dict(sys.modules, {"winreg": fake_reg}), \
+                mock.patch.object(gw.os, "listdir", side_effect=listdir), \
+                mock.patch.object(gw, "_gdi_font_families", return_value=set()):
+            return gw.installed_fonts()
+
     def test_registry_error_but_font_dir_readable(self):
         fake = self._fake_winreg(OSError(5, "拒绝访问"))
-        with mock.patch.object(gw.sys, "platform", "win32"), \
-                mock.patch.dict(sys.modules, {"winreg": fake}), \
-                mock.patch.object(gw.os, "listdir", return_value=["simfang.ttf"]):
-            names, files, errors = gw.installed_fonts()
-        self.assertEqual(names, set())
-        self.assertIn("SIMFANG", files)
-        self.assertTrue(any("读注册表" in e for e in errors))
-        self.assertFalse(any("读系统字体目录" in e for e in errors))
+        scan = self._installed_with(fake, lambda _d: ["simfang.ttf"])
+        self.assertEqual(scan.names, set())
+        self.assertIn("SIMFANG", scan.files)
+        self.assertTrue(any("读注册表" in e for e in scan.errors))
+        self.assertFalse(any("读系统字体目录" in e for e in scan.errors))
 
     def test_registry_ok_fills_names(self):
         fake = mock.MagicMock()
         fake.HKEY_LOCAL_MACHINE = "HKLM"
         fake.HKEY_CURRENT_USER = "HKCU"
+        fake.KEY_READ = 0x20019
+        fake.KEY_WOW64_64KEY = 0x0100
+        fake.KEY_WOW64_32KEY = 0x0200
         key = mock.MagicMock()
         fake.OpenKey.return_value.__enter__.return_value = key
         fake.QueryInfoKey.return_value = (0, 1, 0)
         fake.EnumValue.return_value = ("黑体 (TrueType)", "simhei.ttf", 1)
-        with mock.patch.object(gw.sys, "platform", "win32"), \
-                mock.patch.dict(sys.modules, {"winreg": fake}), \
-                mock.patch.object(gw.os, "listdir", return_value=[]):
-            names, files, errors = gw.installed_fonts()
-        self.assertIn("黑体", names)
-        self.assertIn("SIMHEI", files)
-        self.assertEqual(errors, [])
+        scan = self._installed_with(fake, lambda _d: [])
+        self.assertIn("黑体", scan.names)
+        self.assertIn("SIMHEI", scan.files)
+        self.assertEqual(scan.errors, [])
 
     def test_all_sources_fail_is_detect_error(self):
         fake = self._fake_winreg(OSError(5, "拒绝访问"))
         with mock.patch.object(gw.sys, "platform", "win32"), \
                 mock.patch.dict(sys.modules, {"winreg": fake}), \
-                mock.patch.object(gw.os, "listdir", side_effect=OSError(3, "路径不存在")):
+                mock.patch.object(gw.os, "listdir", side_effect=OSError(3, "路径不存在")), \
+                mock.patch.object(gw, "_gdi_font_families", return_value=set()):
             missing, detect_error = gw.find_missing_fonts()
         self.assertIsNotNone(detect_error)
         self.assertEqual(len(missing), len(gw.REQUIRED_FONTS))
+
+    def test_user_font_dir_is_scanned(self):
+        """用户自装字体在 %LOCALAPPDATA%\\Microsoft\\Windows\\Fonts，不在系统目录。"""
+        fake = self._fake_winreg(OSError(5, "拒绝访问"))
+        user_dir = os.path.join("C:\\Users\\x\\AppData\\Local",
+                                "Microsoft", "Windows", "Fonts")
+
+        def listdir(directory):
+            if directory == user_dir:
+                return ["FZXBSJW.TTF"]
+            raise OSError(3, "路径不存在")
+
+        with mock.patch.dict(os.environ, {"LOCALAPPDATA": "C:\\Users\\x\\AppData\\Local"}):
+            scan = self._installed_with(fake, listdir)
+        self.assertIn("FZXBSJW", scan.files)
+        self.assertTrue(any(p.endswith("FZXBSJW.TTF") for p in scan.paths))
+
+    def test_non_windows_reports_error_and_empty(self):
+        with mock.patch.object(gw.sys, "platform", "linux"):
+            scan = gw.installed_fonts()
+        self.assertEqual(scan.names, set())
+        self.assertEqual(scan.files, set())
+        self.assertTrue(scan.errors)
+
+
+class WesternFontSplitTest(unittest.TestCase):
+    """英文和数字走 Times New Roman，中文仍走中文字体——靠 rFonts 四个属性分流。"""
+
+    def _set_run_font(self):
+        return gw.make_helpers(*gw._import_docx())[0]
+
+    def test_set_run_font_splits_east_asian_and_western(self):
+        doc = Document()
+        run = doc.add_paragraph().add_run("甲乙 ABC 123")
+        self._set_run_font()(run, "仿宋_GB2312", gw.SIZE_BODY)
+        rfonts = run._element.rPr.rFonts
+        self.assertEqual(rfonts.get(qn("w:eastAsia")), "仿宋_GB2312")
+        self.assertEqual(rfonts.get(qn("w:ascii")), "Times New Roman")
+        self.assertEqual(rfonts.get(qn("w:hAnsi")), "Times New Roman")
+        self.assertEqual(rfonts.get(qn("w:cs")), "Times New Roman")
+
+    def test_times_new_roman_is_required(self):
+        self.assertIn(gw.FONT_WESTERN, [font for font, _ in gw.REQUIRED_FONTS])
+
+
+class HeadingWarningsTest(unittest.TestCase):
+    """层级标记和中文编号不配套时要提醒——写错了字体全错，肉眼很难发现。"""
+
+    def test_matching_numbering_is_silent(self):
+        blocks = [("h1", "一、总则"), ("h2", "（一）范围"),
+                  ("h3", "1. 适用"), ("h4", "（1）细则")]
+        self.assertEqual(gw.heading_warnings(blocks), [])
+
+    def test_unnumbered_heading_is_silent(self):
+        # 不是所有标题都带编号，「使用说明」这种不该被提醒
+        self.assertEqual(gw.heading_warnings([("h1", "使用说明"), ("h2", "总则")]), [])
+
+    def test_h2_with_level_one_numbering_warns(self):
+        warnings = gw.heading_warnings([("h2", "一、大作文")])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("##", warnings[0])
+        self.assertIn("（一）", warnings[0])
+
+    def test_h3_with_paren_numbering_warns(self):
+        warnings = gw.heading_warnings([("h3", "（一）这里该用数字")])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("###", warnings[0])
+
+    def test_h4_with_arabic_ordinal_warns(self):
+        warnings = gw.heading_warnings([("h4", "1. 该用括号数字")])
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("（1）", warnings[0])
+
+    def test_paragraphs_are_never_checked(self):
+        self.assertEqual(gw.heading_warnings([("p", "一、正文里的编号")]), [])
+
+
+class VerifyOutputTest(unittest.TestCase):
+    """--verify 自检：合规文档放行，字体写错的要抓出来。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.out = os.path.join(self.tmp, "out.docx")
+
+    def _generate(self, body_text):
+        path = os.path.join(self.tmp, "body.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body_text)
+        argv = ["--out", self.out, "--title", "关于开展××工作的通知", "--body", path]
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gw.main(argv), 0)
+
+    def test_clean_document_passes(self):
+        self._generate("# 一、总则\n\n正文第 1 段，含 English 与数字 2025。\n")
+        self.assertEqual(gw.verify_output(self.out), [])
+
+    def test_verify_flag_returns_0_on_clean_document(self):
+        path = os.path.join(self.tmp, "body.txt")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("正文第 1 段。\n")
+        argv = ["--out", self.out, "--title", "关于开展××工作的通知",
+                "--body", path, "--verify"]
+        with mock.patch.object(gw, "find_missing_fonts", return_value=([], None)), \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(gw.main(argv), 0)
+
+    def test_grabs_western_font_that_is_not_times_new_roman(self):
+        # 手工把某个 run 的西文字体改掉，模拟旧版本脚本生成的文件
+        self._generate("正文第 1 段。\n")
+        doc = Document(self.out)
+        run = [p for p in doc.paragraphs if p.text.strip()][0].runs[0]
+        run._element.rPr.rFonts.set(qn("w:ascii"), "仿宋_GB2312")
+        doc.save(self.out)
+        problems = gw.verify_output(self.out)
+        self.assertTrue(any("Times New Roman" in p for p in problems), problems)
 
 
 if __name__ == "__main__":
